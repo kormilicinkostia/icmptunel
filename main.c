@@ -6,7 +6,9 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
+#include <linux/tcp.h>
 #include <net/arp.h>
+#include <net/tcp.h>
 
 
 struct task_data 
@@ -57,8 +59,8 @@ static int find_mac_addr (uint8_t* mac, uint32_t ip, struct net_device *dev)
     return -1;
 }
 
-static struct sk_buff* create_packet_input (struct sk_buff* in_packet)
-{    
+static struct sk_buff* create_udp_input (struct sk_buff* in_packet)
+{
     struct iphdr* ip_in = ip_hdr(in_packet);
 
     struct net_device *dev = dev_get_by_name(&init_net, "lo");
@@ -77,7 +79,6 @@ static struct sk_buff* create_packet_input (struct sk_buff* in_packet)
 
     struct icmphdr* icmp_in = icmp_hdr(in_packet);
 
-
     uint16_t data_len = (uint8_t*)skb_tail_pointer(in_packet) 
                         - (uint8_t*)icmp_in 
                         - sizeof(struct icmphdr)
@@ -87,8 +88,6 @@ static struct sk_buff* create_packet_input (struct sk_buff* in_packet)
                     + sizeof(struct udphdr)
                     + data_len;
     
-    pr_info("create_packet_input %d\n",data_len);
-    //return NULL;
     int hh_len = LL_RESERVED_SPACE(dev);
     int tlen = dev->needed_tailroom;
     struct sk_buff* skb = netdev_alloc_skb(dev, hh_len + tlen + packet_size);
@@ -123,8 +122,8 @@ static struct sk_buff* create_packet_input (struct sk_buff* in_packet)
     uint8_t* data_in = (uint8_t*)(icmp_in + 1);
     struct udphdr* udph_in = (struct udphdr*)data_in;
     struct udphdr* udph = udp_hdr(skb);
-    udph->source = htons(4020);//udph_in->dest;
-    udph->dest = htons(4020);//udph_in->source;
+    udph->source = udph_in->source ;
+    udph->dest = udph_in->dest;
     udph->len = udph_in->len;
     udph->check = 0;
     uint8_t* data_out = (uint8_t*)(udph + 1);
@@ -138,12 +137,118 @@ static struct sk_buff* create_packet_input (struct sk_buff* in_packet)
     memcpy(eth_out->h_source, mac_in, ETH_ALEN);
     memcpy(eth_out->h_dest, dev->dev_addr, ETH_ALEN);
     eth_out->h_proto = htons(0x0800);
-    //memcpy(eth_out, eth_in, sizeof (struct ethhdr));
-    pr_info("port in %d: %d\n",ntohs(udph->source),ntohs(udph->dest));
-    pr_info("icmp: %*ph\n",(uint8_t*)skb_tail_pointer(in_packet) - (uint8_t*)icmp_in, icmp_in);
-    pr_info("udp: %*ph\n",sizeof(struct udphdr), udph);
-    pr_info("data %d: %*ph\n",data_len,data_len, data_out);
+
     return skb;
+}
+
+static struct sk_buff* create_tcp_input (struct sk_buff* in_packet)
+{
+    struct iphdr* ip_in = ip_hdr(in_packet);
+
+    struct net_device *dev = dev_get_by_name(&init_net, "lo");
+    if (!dev)
+     {
+        pr_err("Cannot get device\n");
+        return NULL;
+    }
+    
+    uint8_t mac_in[ETH_ALEN];
+    if (find_mac_addr (mac_in, ip_in->saddr, in_packet->dev) < 0)
+    {
+        pr_info("Not faund mac\n");
+        return NULL;
+    }  
+
+    struct icmphdr* icmp_in = icmp_hdr(in_packet);    
+    uint8_t* data_in = (uint8_t*)(icmp_in + 1);
+    struct tcphdr* tcp_in = (struct tcphdr*)data_in;
+
+    uint32_t tcp_header_len = __tcp_hdrlen(tcp_in);
+    
+
+    uint16_t data_len = (uint8_t*)skb_tail_pointer(in_packet) 
+                        - (uint8_t*)icmp_in 
+                        - sizeof(struct icmphdr)
+                        - tcp_header_len;
+    int packet_size = sizeof(struct ethhdr) 
+                    + sizeof(struct iphdr) 
+                    + tcp_header_len
+                    + data_len;
+    
+    int hh_len = LL_RESERVED_SPACE(dev);
+    int tlen = dev->needed_tailroom;
+    struct sk_buff* skb = netdev_alloc_skb(dev, hh_len + tlen + packet_size);
+    if (unlikely(!skb)) 
+    {
+        pr_err("netdev_alloc_skb failed\n");
+        return NULL;
+    }
+
+    skb_reserve(skb, hh_len);
+    skb->dev = dev;
+    skb->protocol = htons(ETH_P_IP);
+
+    skb_put(skb, packet_size);
+    skb_reset_network_header(skb);
+    skb_set_transport_header(skb, sizeof(struct iphdr));
+    
+    struct iphdr* ip_out = ip_hdr(skb);
+    ip_out->version = 4;
+    ip_out->ihl = 5;
+    ip_out->tos = 0;
+    ip_out->tot_len = htons(packet_size - sizeof(struct ethhdr));
+    ip_out->id = 0;
+    ip_out->frag_off = htons(0x4000);
+    ip_out->ttl = 64;
+    ip_out->protocol = IPPROTO_TCP;
+    ip_out->saddr = ip_in->saddr;
+    ip_out->daddr = ip_in->daddr;
+    ip_out->check = 0;
+    ip_out->check = ip_fast_csum((u8 *)ip_out, ip_out->ihl);
+    skb->ip_summed = CHECKSUM_NONE;
+    
+    struct tcphdr* tcph = tcp_hdr(skb);
+    memcpy (tcph, tcp_in, __tcp_hdrlen(tcp_in));
+    tcph->check = 0;
+ 
+    int tcplen = tcp_header_len + data_len;
+    uint8_t* data_out = (uint8_t*)tcph + tcp_header_len;
+    memcpy (data_out, data_in + tcp_header_len, data_len);
+
+    // 4. Вычисляем контрольную сумму (псевдоголовок + данные)
+    tcph->check = tcp_v4_check(tcplen, 
+                                ip_out->saddr, 
+                                ip_out->daddr, 
+                                csum_partial((char *)tcph, tcplen, 0));
+    
+    skb_push(skb, sizeof(struct ethhdr));
+    skb_reset_mac_header(skb); 
+
+    struct ethhdr *eth_out = eth_hdr(skb);
+    memset (eth_out, 0, sizeof (struct ethhdr));
+    memcpy(eth_out->h_source, mac_in, ETH_ALEN);
+    memcpy(eth_out->h_dest, dev->dev_addr, ETH_ALEN);
+    eth_out->h_proto = htons(0x0800);
+
+    
+
+
+
+    return skb;
+}
+
+
+static struct sk_buff* create_packet_input (struct sk_buff* in_packet)
+{    
+    struct icmphdr* icmp_in = icmp_hdr(in_packet);
+    uint16_t id = ntohs(icmp_in->un.echo.id);
+    struct transfer_header* header = (struct transfer_header*)&id;
+    if (header->type == 0)
+        return create_udp_input (in_packet);
+    else if (header->type == 1)
+        return create_tcp_input (in_packet);
+
+    return NULL;
 }
 
 static unsigned int input_hook (void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
@@ -185,8 +290,7 @@ static struct sk_buff* udp_to_icmp (struct sk_buff* in_packet)
         return NULL;
     }
     struct udphdr* in_udp =  udp_hdr (in_packet);
-    if (ntohs(in_udp->dest) != 4020)
-        return NULL;
+
     uint16_t data_len = ntohs(in_udp->len) - sizeof(struct udphdr);
     int packet_size = sizeof(struct ethhdr) 
                     + sizeof(struct iphdr) 
@@ -256,7 +360,104 @@ static struct sk_buff* udp_to_icmp (struct sk_buff* in_packet)
     memcpy(eth_out->h_source, skb->dev->dev_addr, ETH_ALEN);
     memcpy(eth_out->h_dest, mac_out, ETH_ALEN);
     eth_out->h_proto = htons(0x0800);
-    pr_info("out %d: %*ph\n",data_len,data_len, data_out);
+    return skb;
+}
+
+static struct sk_buff* tcp_to_icmp (struct sk_buff* in_packet)
+{
+    struct iphdr* ip_in = ip_hdr(in_packet);
+    uint8_t mac_out[ETH_ALEN];
+    if (find_mac_addr (mac_out, ip_in->daddr, in_packet->dev) < 0)
+    {
+        pr_info("Not faund mac\n");
+        return NULL;
+    }
+     
+    
+    if (skb_linearize(in_packet)) {
+        pr_info("Failed to linearize skb\n");
+        return NULL;
+    }
+    
+    // Теперь указатели корректны
+    struct tcphdr* in_tcp = tcp_hdr(in_packet); 
+
+
+    uint16_t data_len =ntohs(ip_hdr(in_packet)->tot_len) 
+                        - (ip_hdr(in_packet)->ihl * 4) 
+                        - (tcp_hdrlen(in_packet));
+
+    int packet_size = sizeof(struct ethhdr) 
+                    + sizeof(struct iphdr) 
+                    + sizeof(struct icmphdr)
+                    + (tcp_hdrlen(in_packet))
+                    + data_len;
+
+    
+
+
+
+    int hh_len = LL_RESERVED_SPACE(in_packet->dev);
+    int tlen = in_packet->dev->needed_tailroom;
+    struct sk_buff* skb = netdev_alloc_skb(in_packet->dev, hh_len + tlen + packet_size);
+    if (unlikely(!skb)) 
+    {
+        pr_err("netdev_alloc_skb failed\n");
+        return NULL;
+    }
+
+    skb_reserve(skb, hh_len);
+    skb->dev = in_packet->dev;
+    skb->protocol = htons(ETH_P_IP);
+
+    skb_put(skb, packet_size);
+    skb_reset_network_header(skb);
+    skb_set_transport_header(skb, sizeof(struct iphdr));
+    
+    struct iphdr* ip_out = ip_hdr(skb);
+    ip_out->version = 4;
+    ip_out->ihl = 5;
+    ip_out->tos = 0;
+    ip_out->tot_len = htons(packet_size - sizeof(struct ethhdr));
+    ip_out->id = 0;
+    ip_out->frag_off = htons(0x4000);
+    ip_out->ttl = 64;
+    ip_out->protocol = IPPROTO_ICMP;
+    ip_out->saddr = ip_in->saddr;
+    ip_out->daddr = ip_in->daddr;
+    ip_out->check = 0;
+    ip_out->check = ip_fast_csum((u8 *)ip_out, ip_out->ihl);
+
+    struct transfer_header header;
+    static uint8_t id = 0;
+    header.id = id++;
+    header.last = 1;
+    header.type = 1;
+    
+    struct icmphdr* icmp = icmp_hdr(skb);
+    icmp->type = ICMP_ECHO;
+    icmp->code = 0;
+    icmp->checksum = 0;
+    icmp->un.echo.id = htons(*(uint16_t*)&header);
+    icmp->un.echo.sequence = 1;
+
+    uint8_t* data_out = (uint8_t*)(icmp + 1);
+    memcpy (data_out, in_tcp, tcp_hdrlen(in_packet));
+    data_out += tcp_hdrlen(in_packet);
+    uint8_t* data_in = (unsigned char *)in_tcp + tcp_hdrlen(in_packet);
+    memcpy (data_out, data_in, data_len);
+    icmp->checksum = ip_compute_csum(icmp, sizeof(struct icmphdr) 
+                                            + sizeof(struct udphdr)
+                                            + data_len);
+    
+    skb_push(skb, sizeof(struct ethhdr));
+    skb_reset_mac_header(skb); 
+
+    struct ethhdr *eth_out = eth_hdr(skb);
+    memset (eth_out, 0, sizeof (struct ethhdr));
+    memcpy(eth_out->h_source, skb->dev->dev_addr, ETH_ALEN);
+    memcpy(eth_out->h_dest, mac_out, ETH_ALEN);
+    eth_out->h_proto = htons(0x0800);
     return skb;
 }
 
@@ -269,9 +470,12 @@ static struct sk_buff* create_packet_output (struct sk_buff* in_packet)
     {
         return udp_to_icmp (in_packet);
     }
+    else if (ip->protocol == IPPROTO_TCP)
+    {
+        return tcp_to_icmp (in_packet);
+    }
     else
     {
-        pr_err("create_icmp_packet invalid proto %d\n",ip->protocol);
         return NULL;
     }
 }
@@ -289,7 +493,6 @@ static unsigned int output_hook (void *priv, struct sk_buff *skb, const struct n
         kfree_skb(skb_out);
         return NF_ACCEPT;
     }
-    pr_info ("start icmp packet\n");
     data->skb = skb_out;
     tasklet_init(&data->tasklet, send_func, (unsigned long)data);
     tasklet_schedule(&data->tasklet);
