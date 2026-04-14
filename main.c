@@ -24,6 +24,11 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kormi Ka");
 MODULE_DESCRIPTION("A simple example Linux module.");
 MODULE_VERSION("0.01");
+static int max_size = 32; 
+
+
+module_param(max_size, int, 0644);
+MODULE_PARM_DESC(my_int, "Max size out packet");
 
 void send_func (unsigned long d)
 {
@@ -356,7 +361,6 @@ static struct sk_buff* create_packet_output(struct sk_buff* in_packet)
     
     int hh_len = LL_RESERVED_SPACE(in_packet->dev);
     int tlen = in_packet->dev->needed_tailroom;
-    static const int max_size = 10;
     struct sk_buff* skb_out = NULL;
     struct sk_buff* skb_current = NULL;
     uint16_t frag = 0;
