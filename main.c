@@ -166,7 +166,7 @@ static struct sk_buff* create_packet_input(struct sk_buff* in_packet,struct list
         transport_header_len = sizeof(struct udphdr);
         struct udphdr* udph = udp_hdr(skb);
         udph->check = 0;
-        pr_info ("in packet1 %u %d : %*ph\n",(uint8_t*)udph,addr_transport_header -  (uint8_t*)udph,size, (uint8_t*)udph);
+        
     } 
     else 
     {  
@@ -319,7 +319,7 @@ static struct sk_buff* create_packet_output(struct sk_buff* in_packet)
     uint16_t data_len;
     uint8_t* data_in;
     
-    if (ip_in->protocol != IPPROTO_UDP /*&& ip_in->protocol != IPPROTO_TCP*/) 
+    if (ip_in->protocol != IPPROTO_UDP && ip_in->protocol != IPPROTO_TCP) 
     {
         return NULL;
     }
